@@ -63,10 +63,13 @@ class VerificationCoordinator:
                 error="Exact SMT is disabled for approximate decimal inputs or assumptions"))
         elif z3.available:
             try:
-                status, model = z3.counterexample_equivalence(left, right, assumptions, domains)
+                status, model, z3_detail = z3.counterexample_equivalence(
+                    left, right, assumptions, domains)
                 zs = VerificationStatus(status)
                 evidence.append(EngineEvidence(engine="z3", capability="counterexample", status=zs,
-                    trust=TrustLevel.EXACT, detail={"counterexample": model} if model else {}))
+                    trust=TrustLevel.EXACT, detail={**z3_detail,
+                                                   **({"counterexample": model} if model else {})}))
+                detail["admissibility_constraints"] = z3_detail["admissibility_constraints"]
                 if model: detail["counterexample"] = model
             except (TypeError, ValueError) as exc:
                 evidence.append(EngineEvidence(engine="z3", capability="counterexample",

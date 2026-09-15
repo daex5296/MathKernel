@@ -29,6 +29,7 @@ _PY_CALLS = {"sqrt": "math.sqrt", "sin": "math.sin", "cos": "math.cos", "tan": "
              "factorial": "math.factorial"}
 _C_CALLS = {"sqrt": "sqrt", "sin": "sin", "cos": "cos", "tan": "tan", "exp": "exp",
             "log": "log", "abs": "fabs", "gamma": "tgamma"}
+_CONSTANTS = {"pi": "3.14159265358979323846264338327950288"}
 
 
 def _emit(ir: Expr, var_map: dict[str, str], calls: dict[str, str], pow_fmt: str) -> str:
@@ -41,8 +42,6 @@ def _emit(ir: Expr, var_map: dict[str, str], calls: dict[str, str], pow_fmt: str
     if isinstance(ir, RationalNode):
         return f"(({ir.numerator}.0)/({ir.denominator}.0))"
     if isinstance(ir, SymbolNode):
-        if ir.name == "pi":
-            return "3.14159265358979323846264338327950288"
         if ir.name in var_map:
             return var_map[ir.name]
         raise ValueError(f"unbound symbol in numeric fragment: {ir.name}")
@@ -58,6 +57,10 @@ def _emit(ir: Expr, var_map: dict[str, str], calls: dict[str, str], pow_fmt: str
             return f"({_emit(ir.left, var_map, calls, pow_fmt)} ** {_emit(ir.right, var_map, calls, pow_fmt)})"
         return f"pow({_emit(ir.left, var_map, calls, pow_fmt)}, {_emit(ir.right, var_map, calls, pow_fmt)})"
     if isinstance(ir, CallNode):
+        if ir.name in _CONSTANTS:
+            if ir.args:
+                raise ValueError(f"constant {ir.name} does not accept arguments")
+            return _CONSTANTS[ir.name]
         if ir.name not in calls:
             raise ValueError(f"function {ir.name} is outside the numeric fragment")
         return f"{calls[ir.name]}(" + ", ".join(_emit(a, var_map, calls, pow_fmt) for a in ir.args) + ")"
@@ -93,6 +96,57 @@ def compile_float64(ir: Expr, variables: list[str], njit: bool = False):
         except Exception:
             return None
     return fn
+
+
+def sampled_quadrature_float64(x, y, *, axis: int = -1,
+                               cumulative: bool = False,
+                               max_points: int = 1_000_000,
+                               max_cells: int = 5_000_000) -> dict:
+    """Composite trapezoidal quadrature for supplied, irregular samples."""
+    import numpy as np
+    if isinstance(axis, bool) or not isinstance(axis, int):
+        raise ValueError("axis must be an integer")
+    if not isinstance(cumulative, bool):
+        raise ValueError("cumulative must be a boolean")
+    try:
+        abscissae = np.asarray(x, dtype=np.float64)
+        values = np.asarray(y, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("x and y must contain rectangular numeric data") from exc
+    if abscissae.ndim != 1 or abscissae.size < 2:
+        raise ValueError("x must be a one-dimensional sequence with at least two points")
+    if abscissae.size > max_points:
+        raise ValueError(f"x exceeds max_sampled_data_points={max_points}")
+    if values.ndim == 0:
+        raise ValueError("y must have at least one dimension")
+    if values.size > max_cells:
+        raise ValueError(f"y exceeds max_sampled_data_cells={max_cells}")
+    if not np.all(np.isfinite(abscissae)) or not np.all(np.isfinite(values)):
+        raise ValueError("x and y must contain only finite values")
+    normalized_axis = axis if axis >= 0 else values.ndim + axis
+    if normalized_axis < 0 or normalized_axis >= values.ndim:
+        raise ValueError(f"axis {axis} is out of bounds for y with {values.ndim} dimensions")
+    if values.shape[normalized_axis] != abscissae.size:
+        raise ValueError("the length of x must match y along axis")
+    differences = np.diff(abscissae)
+    increasing = bool(np.all(differences > 0))
+    decreasing = bool(np.all(differences < 0))
+    if not (increasing or decreasing):
+        raise ValueError("x must be strictly monotonic; duplicate or unordered points are invalid")
+    moved = np.moveaxis(values, normalized_axis, -1)
+    areas = (moved[..., 1:] + moved[..., :-1]) * differences / 2.0
+    if cumulative:
+        zeros = np.zeros((*areas.shape[:-1], 1), dtype=np.float64)
+        result = np.concatenate((zeros, np.cumsum(areas, axis=-1)), axis=-1)
+        result = np.moveaxis(result, -1, normalized_axis)
+    else:
+        result = np.sum(areas, axis=-1)
+    return {"values" if cumulative else "value": result.tolist(),
+            "rule": "composite-trapezoid", "interpolation": "piecewise-linear",
+            "source": "supplied-samples", "points": int(abscissae.size),
+            "axis": normalized_axis, "ordering": "increasing" if increasing else "decreasing",
+            "cumulative": cumulative,
+            "error_estimate": None, "error_certified": False}
 
 
 # --- root finding -----------------------------------------------------------------

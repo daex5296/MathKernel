@@ -6,7 +6,7 @@
 
 Mathematical results carry an explicit **trust level**, an **engine** tag, and a **derivation trail**. Exact computation, checked certificates, symbolic results, certified enclosures, empirical evidence, and formal proofs are distinct claims. Exact arithmetic alone is not a formal proof; approximate-input ancestry must not silently disappear.
 
-[![version](https://img.shields.io/badge/version-1.3.1.dev2-blue)]()
+[![version](https://img.shields.io/badge/version-1.3.1.dev3-blue)]()
 [![python](https://img.shields.io/badge/python-%3E%3D3.11-blue)]()
 [![engines](https://img.shields.io/badge/engines-sympy%20%C2%B7%20z3%20%C2%B7%20lean%20%C2%B7%20numba%20%C2%B7%20cuda-orange)]()
 [![license](https://img.shields.io/badge/license-MIT-lightgrey)]()
@@ -1029,7 +1029,7 @@ current support limits.
 | Probability | `math_prob_rv_create`, `math_prob_expectation`, `math_prob_variance`, `math_prob_covariance`, `math_prob_bayes`, `math_prob_markov_stationary`, `math_prob_markov_hitting_time`, `math_prob_sample`, `math_prob_distribution` |
 | Statistics | `math_stats_moments`, `math_stats_order`, `math_stats_regression`, `math_stats_correlation`, `math_stats_ttest`, `math_stats_chi2`, `math_stats_confidence_interval`, `math_stats_batch_moments` |
 | Tensors | `math_tensor_create`, `math_tensor_get`, `math_tensor_contract`, `math_tensor_solve` |
-| Numerics | `math_root_find`, `math_root_scan`, `math_quadrature` |
+| Numerics | `math_root_find`, `math_root_scan`, `math_quadrature`, `math_sampled_quadrature` |
 | ODE/PDE | `math_ode_solve`, `math_ode_solve_numeric`, `math_ode_ensemble`, `math_pde_heat_1d`, `math_pde_heat_2d`, `math_pde_wave_1d`, `math_pde_advect_1d`, `math_pde_ensemble`, `math_pde_mol_heat` |
 | Optimization | `math_optimize_critical_points`, `math_optimize_kkt`, `math_lp_solve`, `math_optimize_minimize`, `math_optimize_multistart` |
 | Units | `math_unit_check`, `math_unit_convert`, `math_unit_simplify` |
@@ -1063,6 +1063,7 @@ All settings are environment-driven with the `MATHKERNEL_` prefix
 | `MATHKERNEL_MAX_ITERATIONS` | 10000 | iteration cap for simplex / Nelder-Mead |
 | `MATHKERNEL_TOLERANCE` | 1e-12 | numeric convergence tolerance |
 | `MATHKERNEL_MAX_ODE_STEPS` | 100000 | RK45 integration step cap |
+| `MATHKERNEL_MAX_SAMPLED_DATA_POINTS` / `MATHKERNEL_MAX_SAMPLED_DATA_CELLS` | 1000000 / 5000000 | sampled quadrature grid/payload caps |
 | `MATHKERNEL_STORE_PATH` | unset | opt-in SQLite persistence for expressions/derivations + `math_replay` |
 | `MATHKERNEL_PROVE_PORTFOLIO_SIZE` | 3 | SMT encodings raced per `math_prove` call |
 | `MATHKERNEL_MAX_PDE_GRID` | 1000000 | PDE solver grid-cell cap |

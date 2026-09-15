@@ -8,6 +8,7 @@ from __future__ import annotations
 import functools
 import importlib
 import json
+import math
 import platform
 import sys
 import threading
@@ -1029,6 +1030,7 @@ class MathKernel:
                            "stats_confidence_interval", "stats_batch_moments",
                            "tensor_create", "tensor_get", "tensor_contract", "tensor_solve",
                            "root_find", "root_scan", "quadrature",
+                           "sampled_quadrature",
                            "ode_solve", "ode_solve_numeric", "ode_ensemble", "pde_heat_1d",
                            "optimize_critical_points", "optimize_kkt", "lp_solve",
                            "optimize_minimize", "optimize_multistart",
@@ -1047,12 +1049,15 @@ class MathKernel:
                            "viz_create", "viz_dag", "viz_koopman", "viz_export"],
             "numerics": {"root_finding": ["ridder/secant (mpmath)", "brent float64",
                                           "interval isolation (mpmath.iv)"],
-                         "quadrature": ["tanh-sinh + gauss-legendre cross-check"],
+                         "quadrature": ["tanh-sinh + gauss-legendre cross-check",
+                                        "sampled composite trapezoid"],
                          "engines": ["numeric_high_precision", "interval_certified",
                                      "numeric (float64)"],
                          "parallel": ["root_scan over subintervals"]},
             "ode": {"symbolic": "sympy.dsolve + classification",
-                    "numeric": ["adaptive RK45 (mpmath)", "float64 RK4 (njit)"],
+                    "numeric": ["adaptive RK45 (mpmath)", "float64 RK4 (njit)",
+                                "adaptive float64 solve_ivp (optional sci extra)"],
+                    "trajectory": ["requested t_eval samples", "accepted-step mesh"],
                     "ensemble": ["cuda-rawkernel" if self._numeric_device() == "gpu"
                                  else "process-pool", "process-pool"],
                     "pde": ["1D heat FTCS (njit/cupy)"],
@@ -5636,6 +5641,30 @@ class MathKernel:
                           warnings=warnings, trust=TrustLevel.NUMERIC_HIGH_PRECISION,
                           engine="numerics", derivation=[step])
 
+    def sampled_quadrature(self, x: list[str | float], y: list,
+                           axis: int = -1, cumulative: bool = False,
+                           rule: str = "trapezoid") -> MathResult:
+        """Integrate supplied samples along an explicit, strictly monotonic grid."""
+        from .numerics import sampled_quadrature_float64
+        if rule.strip().lower() not in {"trapezoid", "trapezium", "composite-trapezoid"}:
+            return MathResult(ok=False, status="error",
+                              errors=["rule must be 'trapezoid'"], engine="numerics")
+        try:
+            out = sampled_quadrature_float64(
+                x, y, axis=axis, cumulative=cumulative,
+                max_points=self.settings.max_sampled_data_points,
+                max_cells=self.settings.max_sampled_data_cells)
+        except (ValueError, TypeError, OverflowError) as exc:
+            return MathResult(ok=False, status="error", errors=[str(exc)], engine="numerics")
+        output = out["values" if cumulative else "value"]
+        step = self._record(DerivationStep(
+            step_id=self._id("step"), operation="sampled_quadrature",
+            inputs=[f"supplied-samples:{out['points']}"], output=str(output),
+            engine="numpy", trust=TrustLevel.NUMERIC))
+        return MathResult(ok=True, data=out, trust=TrustLevel.NUMERIC,
+                          engine="numpy", derivation=[step],
+                          warnings=["No certified error bound is available for supplied samples."])
+
     def ode_solve(self, rhs_id: str, y_var: str = "y", x_var: str = "x",
                   ics: dict[str, str] | None = None) -> MathResult:
         """Symbolic dy/dx = rhs(x, y) via sympy.dsolve with classification."""
@@ -5677,10 +5706,21 @@ class MathKernel:
 
     def ode_solve_numeric(self, rhs_ids: list[str], t_span: list[str], y0: list[str],
                           tol: float | None = None, dps: int = 50,
-                          fast: bool = False) -> MathResult:
-        """Numeric IVP for a first-order system. Default: adaptive RK45 on
-        mpmath (numeric_high_precision). fast=True: float64 RK4 (numeric)."""
-        from .ode import compile_rhs_float64, rk45_mpmath, rk4_float64
+                          fast: bool = False, method: str | None = None,
+                          rtol: float | None = None, atol: float | None = None,
+                          max_step: float | None = None, steps: int | None = None,
+                          t_eval: list[str | float] | None = None,
+                          dense_output: bool = False) -> MathResult:
+        """Numeric IVP with selectable solvers and optional trajectory output.
+
+        The default remains arbitrary-precision adaptive RK45. ``fast=True``
+        remains an alias for fixed-step float64 RK4. Adaptive float64 methods
+        (RK23, RK45, DOP853, Radau, BDF, LSODA) require the ``sci`` extra.
+        ``t_eval`` samples one integration through the solver's reported
+        interpolation method; ``dense_output`` returns its accepted mesh.
+        """
+        from .ode import (compile_rhs_float64, rk45_mpmath,
+                          rk4_float64_solution, solve_ivp_float64)
         irs = []
         for rid in rhs_ids:
             ir = self.expressions.get(rid)
@@ -5688,32 +5728,80 @@ class MathKernel:
                 return MathResult(ok=False, status="error",
                                   errors=[f"Unknown expr_id: {rid}"], engine="ode")
             irs.append(ir)
-        tol = tol if tol is not None else self.settings.tolerance
+        base_tol = tol if tol is not None else self.settings.tolerance
         y_vars = [f"y{i}" for i in range(len(irs))]
         try:
+            if len(t_span) != 2:
+                raise ValueError("t_span must contain exactly [start, end]")
+            if len(y0) != len(irs) or not y0:
+                raise ValueError("y0 must contain one value per rhs_id")
+            if t_eval is not None and len(t_eval) > self.settings.max_ode_steps + 1:
+                raise ValueError(f"t_eval exceeds max_ode_steps + 1 ({self.settings.max_ode_steps + 1})")
             t_span = [self._numeric_bound(t) for t in t_span]
             y0 = [self._numeric_bound(v) for v in y0]
-            if fast:
+            selected = method or ("rk4-float64" if fast or steps is not None else "rk45-mpmath")
+            normalized = selected.strip().lower()
+            if fast and normalized not in {"rk4", "rk4-float64"}:
+                raise ValueError("fast=True selects rk4-float64 and cannot be combined with another method")
+            if normalized in {"rk4", "rk4-float64"}:
+                if tol is not None or rtol is not None or atol is not None:
+                    raise ValueError("fixed-step rk4-float64 does not use tol, rtol, or atol; use steps or max_step")
+                step_count = 10_000 if steps is None else steps
+                if isinstance(step_count, bool) or not isinstance(step_count, int) or step_count < 1:
+                    raise ValueError("steps must be a positive integer")
+                span = abs(float(t_span[1]) - float(t_span[0]))
+                if max_step is not None:
+                    if max_step <= 0 or not math.isfinite(max_step):
+                        raise ValueError("max_step must be positive and finite")
+                    step_count = max(step_count, math.ceil(span / max_step))
+                if step_count > self.settings.max_ode_steps:
+                    raise ValueError(f"steps exceeds max_ode_steps={self.settings.max_ode_steps}")
                 f = compile_rhs_float64(irs, y_vars, njit=True) or \
                     compile_rhs_float64(irs, y_vars)
-                y = rk4_float64(f, float(t_span[0]), [float(v) for v in y0],
-                                float(t_span[1]), 10_000)
+                out = rk4_float64_solution(
+                    f, float(t_span[0]), [float(v) for v in y0], float(t_span[1]),
+                    step_count, t_eval=None if t_eval is None else [float(v) for v in t_eval],
+                    dense_output=dense_output)
+                out["controls"]["max_step"] = max_step
                 step = self._record(DerivationStep(step_id=self._id("step"),
                     operation="ode_solve_numeric:float64", inputs=rhs_ids,
-                    output=str(y), engine="ode", trust=TrustLevel.NUMERIC))
-                return MathResult(ok=True, data={"t": t_span[1], "y": [repr(v) for v in y],
-                    "method": "rk4-float64"}, trust=TrustLevel.NUMERIC, engine="ode",
+                    output=f"y({out['t']}) = {out['y']}", engine="ode",
+                    trust=TrustLevel.NUMERIC))
+                return MathResult(ok=True, data=out, trust=TrustLevel.NUMERIC, engine="ode",
                     derivation=[step])
             f_py = compile_rhs_float64(irs, y_vars)
+            if steps is not None:
+                raise ValueError("steps is only valid for the fixed-step rk4-float64 method")
+            effective_rtol = base_tol if rtol is None else rtol
+            effective_atol = base_tol if atol is None else atol
+            if normalized not in {"rk45-mpmath", "mpmath"}:
+                out = run_with_timeout(
+                    solve_ivp_float64, self.settings.solver_timeout_seconds,
+                    f_py, float(t_span[0]), [float(v) for v in y0], float(t_span[1]),
+                    method=selected, rtol=effective_rtol, atol=effective_atol,
+                    max_step=max_step, max_steps=self.settings.max_ode_steps,
+                    t_eval=None if t_eval is None else [float(v) for v in t_eval],
+                    dense_output=dense_output)
+                step = self._record(DerivationStep(step_id=self._id("step"),
+                    operation=f"ode_solve_numeric:{out['method']}", inputs=rhs_ids,
+                    output=f"y({out['t']}) = {out['y']}", engine="ode",
+                    trust=TrustLevel.NUMERIC))
+                return MathResult(ok=out["solver_status"] == "converged",
+                    status="ok" if out["solver_status"] == "converged" else "error",
+                    data=out, errors=[] if out["solver_status"] == "converged" else [out["message"]],
+                    trust=TrustLevel.NUMERIC, engine="ode", derivation=[step])
             import mpmath as mp
             def f_mp(t, y):
                 out = [mp.mpf(0)] * len(y)
                 f_py(t, y, out)
                 return [mp.mpf(v) for v in out]
             out = run_with_timeout(rk45_mpmath, self.settings.solver_timeout_seconds,
-                                   f_mp, t_span[0], y0, t_span[1], tol,
-                                   self.settings.max_ode_steps, dps)
-        except (ValueError, TypeError) as exc:
+                                   f_mp, t_span[0], y0, t_span[1], base_tol,
+                                   self.settings.max_ode_steps, dps,
+                                   rtol=effective_rtol, atol=effective_atol,
+                                   max_step=max_step, t_eval=t_eval,
+                                   dense_output=dense_output)
+        except (ValueError, TypeError, OverflowError) as exc:
             return MathResult(ok=False, status="error", errors=[str(exc)], engine="ode")
         step = self._record(DerivationStep(step_id=self._id("step"),
             operation="ode_solve_numeric", inputs=rhs_ids,
@@ -7841,11 +7929,11 @@ class MathKernel:
         if not self.z3.available: return MathResult(ok=False,status="error",errors=["z3-solver is not installed"],engine="z3")
         assumptions = [a.expression for a in ctx.assumptions] if ctx else []
         domains = ctx.domains if ctx else {}
-        try: status, model = self.z3.counterexample_equivalence(l,r,assumptions,domains)
+        try: status, model, z3_detail = self.z3.counterexample_equivalence(l,r,assumptions,domains)
         except (TypeError, ValueError) as exc:
             return MathResult(ok=True,status="unknown",warnings=[str(exc)],trust=TrustLevel.UNKNOWN,engine="z3")
-        if status == "disproved": return MathResult(ok=True,status="refuted",data={"counterexample":model},trust=TrustLevel.EXACT,engine="z3")
-        if status == "proved": return MathResult(ok=True,status="verified",data={"counterexample":None,"reason":"negation is unsatisfiable"},trust=TrustLevel.EXACT,engine="z3")
+        if status == "disproved": return MathResult(ok=True,status="refuted",data={"counterexample":model, **z3_detail},trust=TrustLevel.EXACT,engine="z3")
+        if status == "proved": return MathResult(ok=True,status="verified",data={"counterexample":None,"reason":"negation is unsatisfiable", **z3_detail},trust=TrustLevel.EXACT,engine="z3")
         return MathResult(ok=True,status="unknown",trust=TrustLevel.UNKNOWN,engine="z3")
 
     def get_expression(self, expr_id: str) -> MathResult:

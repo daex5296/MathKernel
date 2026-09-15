@@ -776,6 +776,15 @@ candidates — rewrite it explicitly and retry.""")
         return kernel.quadrature(expr_id, variable, a, b, dps, cross_check).model_dump(mode="json")
 
     @mcp.tool
+    def math_sampled_quadrature(x: list[str | float], y: list,
+                                axis: int=-1, cumulative: bool=False,
+                                rule: str="trapezoid") -> dict:
+        """Composite trapezoidal integration of supplied, possibly irregular
+        samples. x must be strictly monotonic and match y along axis. Returns
+        numeric evidence; its error estimate is explicitly uncertified."""
+        return kernel.sampled_quadrature(x, y, axis, cumulative, rule).model_dump(mode="json")
+
+    @mcp.tool
     def math_ode_solve(rhs_id: str, y_var: str="y", x_var: str="x",
                        ics: dict[str, str] | None=None) -> dict:
         """Symbolic dy/dx = rhs(x, y) via sympy.dsolve with ODE classification
@@ -784,11 +793,19 @@ candidates — rewrite it explicitly and retry.""")
 
     @mcp.tool
     def math_ode_solve_numeric(rhs_ids: list[str], t_span: list[str], y0: list[str],
-                               tol: float | None=None, dps: int=50, fast: bool=False) -> dict:
+                               tol: float | None=None, dps: int=50, fast: bool=False,
+                               method: str | None=None, rtol: float | None=None,
+                               atol: float | None=None, max_step: float | None=None,
+                               steps: int | None=None,
+                               t_eval: list[str | float] | None=None,
+                               dense_output: bool=False) -> dict:
         """Numeric IVP for a first-order system: rhs_ids[i] is dy_i/dt with state
         variables named y0, y1, ... Default adaptive RK45 on mpmath
-        (numeric_high_precision); fast=True is float64 RK4 (numeric)."""
-        return kernel.ode_solve_numeric(rhs_ids, t_span, y0, tol, dps, fast).model_dump(mode="json")
+        (numeric_high_precision); fast=True is float64 RK4 (numeric). Select
+        adaptive float64 methods with method=RK45/DOP853/Radau/BDF/LSODA.
+        t_eval returns interpolated samples from one integration."""
+        return kernel.ode_solve_numeric(rhs_ids, t_span, y0, tol, dps, fast,
+            method, rtol, atol, max_step, steps, t_eval, dense_output).model_dump(mode="json")
 
     @mcp.tool
     def math_ode_ensemble(rhs_ids: list[str], t_span: list[str], y0s: list[list[float]],

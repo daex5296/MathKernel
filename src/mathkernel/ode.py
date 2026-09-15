@@ -47,23 +47,75 @@ def dsolve_symbolic(rhs, y_var: str, x_var: str, ics: dict | None = None):
 
 
 def rk45_mpmath(f, t0: str, y0: list[str], t1: str, tol: float = 1e-10,
-                max_steps: int = 100_000, dps: int = 50) -> dict:
-    """Adaptive RK45 at arbitrary precision. f(t, y) -> list of derivatives
-    (mpmath objects). Returns the endpoint, step count, and error stats."""
+                max_steps: int = 100_000, dps: int = 50, *,
+                rtol: float | None = None, atol: float | None = None,
+                max_step: float | None = None,
+                t_eval: list[str | float] | None = None,
+                dense_output: bool = False) -> dict:
+    """Adaptive RK45 at arbitrary precision with optional sampled output.
+
+    Requested points are evaluated from cubic-Hermite interpolants over
+    accepted steps, so they do not trigger separate integrations.  The
+    interpolation is reported separately because it has no certified error
+    bound.
+    """
     import mpmath as mp
     mp.mp.dps = dps
     t = mp.mpf(t0)
     y = [mp.mpf(v) for v in y0]
     target = mp.mpf(t1)
     direction = 1 if target >= t else -1
-    h = direction * min(abs(target - t) / 100, mp.mpf("0.1")) or mp.mpf("0.01") * direction
+    rtol_mp = mp.mpf(str(tol if rtol is None else rtol))
+    atol_mp = mp.mpf(str(tol if atol is None else atol))
+    if rtol_mp <= 0 or atol_mp <= 0 or not mp.isfinite(rtol_mp) or not mp.isfinite(atol_mp):
+        raise ValueError("rtol and atol must be positive and finite")
+    max_step_mp = mp.inf if max_step is None else mp.mpf(str(max_step))
+    if max_step_mp <= 0 or (max_step is not None and not mp.isfinite(max_step_mp)):
+        raise ValueError("max_step must be positive and finite")
+    span = abs(target - t)
+    h = direction * min(span / 100, mp.mpf("0.1"), max_step_mp)
+    if h == 0:
+        h = mp.mpf("0.01") * direction
+
+    requested = None
+    if t_eval is not None:
+        requested = [mp.mpf(str(value)) for value in t_eval]
+        if not requested:
+            raise ValueError("t_eval must contain at least one time")
+        if any((value - t) * direction < 0 or (value - target) * direction > 0
+               for value in requested):
+            raise ValueError("t_eval values must lie inside t_span")
+        if any((b - a) * direction <= 0 for a, b in zip(requested, requested[1:])):
+            raise ValueError("t_eval values must be strictly ordered in the integration direction")
+    trajectory_t = [t] if dense_output and requested is None else []
+    trajectory_y = [list(y)] if dense_output and requested is None else []
+    sampled_t: list = []
+    sampled_y: list[list] = []
+    request_index = 0
+    if target == t and requested is not None:
+        sampled_t = list(requested)
+        sampled_y = [list(y) for _ in requested]
+        request_index = len(requested)
+
+    def interpolate(query, left_t, left_y, left_f, right_t, right_y, right_f):
+        width = right_t - left_t
+        s = (query - left_t) / width
+        h00 = 2 * s ** 3 - 3 * s ** 2 + 1
+        h10 = s ** 3 - 2 * s ** 2 + s
+        h01 = -2 * s ** 3 + 3 * s ** 2
+        h11 = s ** 3 - s ** 2
+        return [h00 * left_y[i] + h10 * width * left_f[i] +
+                h01 * right_y[i] + h11 * width * right_f[i]
+                for i in range(len(left_y))]
     steps = 0
     rejected = 0
     max_err = mp.mpf(0)
     n = len(y)
     while (t - target) * direction < 0:
-        if steps >= max_steps:
+        if steps + rejected >= max_steps:
             raise ValueError(f"rk45 exceeded max_steps={max_steps}")
+        if abs(h) > max_step_mp:
+            h = direction * max_step_mp
         if (t + h - target) * direction > 0:
             h = target - t
         k = []
@@ -75,19 +127,52 @@ def rk45_mpmath(f, t0: str, y0: list[str], t1: str, tol: float = 1e-10,
         y5 = [y[i] + h * sum(_DP_B[j] * k[j][i] for j in range(6)) for i in range(n)]
         ks = k + [f(t + h, y5)]
         y4 = [y[i] + h * sum(_DP_B4[j] * ks[j][i] for j in range(7)) for i in range(n)]
-        err = max(abs(y5[i] - y4[i]) for i in range(n))
+        errors = [abs(y5[i] - y4[i]) for i in range(n)]
+        err = max(errors)
         max_err = max(max_err, err)
-        if err <= tol:
+        error_norm = max(errors[i] /
+                         (atol_mp + rtol_mp * max(abs(y[i]), abs(y5[i])))
+                         for i in range(n))
+        if error_norm <= 1:
+            old_t, old_y, old_f = t, y, k[0]
             t += h
             y = y5
             steps += 1
+            new_f = ks[-1]
+            if requested is not None:
+                while request_index < len(requested) and (requested[request_index] - t) * direction <= 0:
+                    query = requested[request_index]
+                    values = old_y if query == old_t else (y if query == t else
+                        interpolate(query, old_t, old_y, old_f, t, y, new_f))
+                    sampled_t.append(query); sampled_y.append(list(values))
+                    request_index += 1
+            elif dense_output:
+                trajectory_t.append(t); trajectory_y.append(list(y))
         else:
             rejected += 1
-        factor = 0.9 * (mp.mpf(tol) / (err + mp.mpf("1e-300"))) ** mp.mpf("0.2")
+        factor = mp.mpf("0.9") * (1 / (error_norm + mp.mpf("1e-300"))) ** mp.mpf("0.2")
         h *= min(mp.mpf(5), max(mp.mpf("0.2"), factor))
-    return {"t": mp.nstr(t, 30), "y": [mp.nstr(v, 30) for v in y],
-            "steps": steps, "rejected_steps": rejected,
-            "max_local_error": mp.nstr(max_err, 5), "dps": dps}
+    out = {"t": mp.nstr(t, 30), "y": [mp.nstr(v, 30) for v in y],
+           "method": "rk45-mpmath", "solver_status": "converged",
+           "accepted_steps": steps, "steps": steps, "rejected_steps": rejected,
+           "controls": {"rtol": str(rtol_mp), "atol": str(atol_mp),
+                        "max_step": None if max_step is None else str(max_step_mp),
+                        "max_steps": max_steps, "dps": dps},
+           "error_estimates": {
+               "integration": {"method": "dormand-prince-embedded-4-5",
+                               "max_local_absolute_error": mp.nstr(max_err, 8),
+                               "certified": False},
+               "interpolation": {"method": "cubic-hermite",
+                                 "estimate": None, "certified": False}},
+           "max_local_error": mp.nstr(max_err, 5), "dps": dps}
+    times = sampled_t if requested is not None else trajectory_t
+    states = sampled_y if requested is not None else trajectory_y
+    if requested is not None or dense_output:
+        out["trajectory"] = {"t": [mp.nstr(value, 30) for value in times],
+                             "y": [[mp.nstr(value, 30) for value in row] for row in states],
+                             "requested": requested is not None,
+                             "interpolation": "cubic-hermite"}
+    return out
 
 
 def compile_rhs_float64(rhs_irs: list[Expr], y_vars: list[str], t_var: str = "t",
@@ -132,6 +217,173 @@ def rk4_float64(f, t0: float, y0: list[float], t1: float, steps: int) -> list[fl
         y += (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
         t = t0 + (s + 1) * h
     return y.tolist()
+
+
+def rk4_float64_solution(f, t0: float, y0: list[float], t1: float, steps: int,
+                         *, t_eval: list[float] | None = None,
+                         dense_output: bool = False) -> dict:
+    """Fixed-step RK4 with optional cubic-Hermite trajectory sampling."""
+    import numpy as np
+    if steps < 1:
+        raise ValueError("steps must be positive")
+    direction = 1 if t1 >= t0 else -1
+    requested = None if t_eval is None else [float(v) for v in t_eval]
+    if requested is not None:
+        if not requested:
+            raise ValueError("t_eval must contain at least one time")
+        if any(not math.isfinite(v) or (v - t0) * direction < 0 or (v - t1) * direction > 0
+               for v in requested):
+            raise ValueError("t_eval values must be finite and lie inside t_span")
+        if any((b - a) * direction <= 0 for a, b in zip(requested, requested[1:])):
+            raise ValueError("t_eval values must be strictly ordered in the integration direction")
+    if t0 == t1:
+        row = [repr(float(v)) for v in y0]
+        out = {"t": repr(float(t1)), "y": row, "method": "rk4-float64",
+               "solver_status": "converged", "accepted_steps": 0, "steps": 0,
+               "rejected_steps": 0, "controls": {"steps": steps},
+               "error_estimates": {
+                   "integration": {"method": None, "estimate": None, "certified": False},
+                   "interpolation": {"method": "cubic-hermite", "estimate": None,
+                                     "certified": False}}}
+        if requested is not None or dense_output:
+            times = requested if requested is not None else [t0]
+            out["trajectory"] = {"t": [repr(float(v)) for v in times],
+                                 "y": [list(row) for _ in times],
+                                 "requested": requested is not None,
+                                 "interpolation": "cubic-hermite"}
+        return out
+    y = np.asarray(y0, dtype=np.float64)
+    h = (t1 - t0) / steps
+    n = y.size
+    k1 = np.zeros(n); k2 = np.zeros(n); k3 = np.zeros(n); k4 = np.zeros(n)
+    yt = np.zeros(n); f_right = np.zeros(n)
+    accepted_t = [float(t0)] if dense_output and requested is None else []
+    accepted_y = [y.tolist()] if dense_output and requested is None else []
+    sampled_t: list[float] = []; sampled_y: list[list[float]] = []; q = 0
+    t = float(t0)
+    for index in range(steps):
+        old_t, old_y = t, y.copy()
+        f(t, y, k1)
+        yt[:] = y + 0.5 * h * k1; f(t + 0.5 * h, yt, k2)
+        yt[:] = y + 0.5 * h * k2; f(t + 0.5 * h, yt, k3)
+        yt[:] = y + h * k3; f(t + h, yt, k4)
+        y += (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+        t = t0 + (index + 1) * h
+        if requested is not None:
+            f(t, y, f_right)
+            while q < len(requested) and (requested[q] - t) * direction <= 0:
+                query = requested[q]
+                s = (query - old_t) / h
+                row = ((2*s**3-3*s**2+1)*old_y + (s**3-2*s**2+s)*h*k1 +
+                       (-2*s**3+3*s**2)*y + (s**3-s**2)*h*f_right)
+                sampled_t.append(query); sampled_y.append(row.tolist()); q += 1
+        elif dense_output:
+            accepted_t.append(float(t)); accepted_y.append(y.tolist())
+    out = {"t": repr(float(t1)), "y": [repr(float(v)) for v in y],
+           "method": "rk4-float64", "solver_status": "converged",
+           "accepted_steps": steps, "steps": steps, "rejected_steps": 0,
+           "controls": {"steps": steps},
+           "error_estimates": {
+               "integration": {"method": None, "estimate": None, "certified": False},
+               "interpolation": {"method": "cubic-hermite", "estimate": None,
+                                 "certified": False}}}
+    times = sampled_t if requested is not None else accepted_t
+    states = sampled_y if requested is not None else accepted_y
+    if requested is not None or dense_output:
+        out["trajectory"] = {"t": [repr(v) for v in times],
+                             "y": [[repr(v) for v in row] for row in states],
+                             "requested": requested is not None,
+                             "interpolation": "cubic-hermite"}
+    return out
+
+
+def solve_ivp_float64(f, t0: float, y0: list[float], t1: float, *, method: str,
+                      rtol: float, atol: float, max_step: float | None,
+                      max_steps: int, t_eval: list[float] | None = None,
+                      dense_output: bool = False) -> dict:
+    """SciPy adaptive float64 route, kept optional behind the ``sci`` extra."""
+    try:
+        import numpy as np
+        from scipy.integrate import solve_ivp
+    except ImportError as exc:
+        raise ValueError("adaptive float64 ODE methods require the 'sci' extra") from exc
+    allowed = {"RK23": "RK23", "RK45": "RK45", "DOP853": "DOP853",
+               "RADAU": "Radau", "BDF": "BDF", "LSODA": "LSODA"}
+    key = method.upper()
+    if key not in allowed:
+        raise ValueError(f"unsupported adaptive float64 method: {method}")
+    canonical = allowed[key]
+    if rtol <= 0 or atol <= 0 or not math.isfinite(rtol) or not math.isfinite(atol):
+        raise ValueError("rtol and atol must be positive and finite")
+    if max_step is not None and (max_step <= 0 or not math.isfinite(max_step)):
+        raise ValueError("max_step must be positive and finite")
+    direction = 1 if t1 >= t0 else -1
+    requested = None if t_eval is None else np.asarray(t_eval, dtype=float)
+    if requested is not None:
+        if requested.ndim != 1 or requested.size == 0 or not np.all(np.isfinite(requested)):
+            raise ValueError("t_eval must be a nonempty finite one-dimensional sequence")
+        if np.any((requested - t0) * direction < 0) or np.any((requested - t1) * direction > 0):
+            raise ValueError("t_eval values must lie inside t_span")
+        if np.any(np.diff(requested) * direction <= 0):
+            raise ValueError("t_eval values must be strictly ordered in the integration direction")
+    if t0 == t1:
+        row = [repr(float(v)) for v in y0]
+        out = {"t": repr(float(t1)), "y": row, "method": canonical,
+               "solver_status": "converged", "message": "zero-length interval",
+               "accepted_steps": 0, "rejected_steps": 0, "function_evaluations": 0,
+               "controls": {"rtol": rtol, "atol": atol, "max_step": max_step,
+                            "max_steps": max_steps},
+               "error_estimates": {
+                   "integration": {"method": "solver-controlled-local-error",
+                                   "estimate": "0", "certified": False},
+                   "interpolation": {"method": f"{canonical}-continuous-extension",
+                                     "estimate": "0", "certified": False}}}
+        if requested is not None or dense_output:
+            times = requested.tolist() if requested is not None else [t0]
+            out["trajectory"] = {"t": [repr(float(v)) for v in times],
+                                 "y": [list(row) for _ in times],
+                                 "requested": requested is not None,
+                                 "interpolation": f"{canonical}-continuous-extension"}
+        return out
+
+    def rhs(t, y):
+        out = np.empty_like(y)
+        f(t, y, out)
+        return out
+
+    solution = solve_ivp(rhs, (t0, t1), np.asarray(y0, dtype=float), method=canonical,
+                         rtol=rtol, atol=atol,
+                         max_step=math.inf if max_step is None else max_step,
+                         dense_output=requested is not None or dense_output)
+    accepted = max(0, len(solution.t) - 1)
+    if accepted > max_steps:
+        raise ValueError(f"adaptive solver exceeded max_steps={max_steps}")
+    out = {"t": repr(float(solution.t[-1])),
+           "y": [repr(float(v)) for v in solution.y[:, -1]],
+           "method": canonical, "solver_status": "converged" if solution.success else "failed",
+           "message": solution.message, "accepted_steps": accepted,
+           "rejected_steps": None, "function_evaluations": int(solution.nfev),
+           "controls": {"rtol": rtol, "atol": atol, "max_step": max_step,
+                        "max_steps": max_steps},
+           "error_estimates": {
+               "integration": {"method": "solver-controlled-local-error",
+                               "estimate": None, "certified": False},
+               "interpolation": {"method": f"{canonical}-continuous-extension",
+                                 "estimate": None, "certified": False}}}
+    if requested is not None:
+        values = solution.sol(requested)
+        out["trajectory"] = {"t": [repr(float(v)) for v in requested],
+                             "y": [[repr(float(v)) for v in values[:, i]]
+                                   for i in range(values.shape[1])],
+                             "requested": True,
+                             "interpolation": f"{canonical}-continuous-extension"}
+    elif dense_output:
+        out["trajectory"] = {"t": [repr(float(v)) for v in solution.t],
+                             "y": [[repr(float(v)) for v in solution.y[:, i]]
+                                   for i in range(solution.y.shape[1])],
+                             "requested": False,
+                             "interpolation": f"{canonical}-continuous-extension"}
+    return out
 
 
 def _rk4_njit():

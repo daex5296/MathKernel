@@ -12,10 +12,15 @@ kernel.root_find(eid, "x", a="1", b="2", certified=True)  # interval_certified
 kernel.root_find(eid, "x", a="1", b="2", fast=True)       # float64 Brent
 kernel.root_scan(eid, "x", "0.5", "10", intervals=64)     # process pool
 kernel.quadrature(eid, "x", "0", "pi")                    # tanh-sinh + GL check
+kernel.sampled_quadrature([0, 0.5, 2], [0, 0.25, 4])       # irregular samples
 ```
 
 Bounds accept MathIR (`"pi"`, `"1/3"`, `"sqrt(2)"`). Quadrature cross-checks
 tanh-sinh against Gauss-Legendre; disagreement returns `status="conflict"`.
+Sampled quadrature uses the composite trapezoid rule (piecewise-linear
+interpolation), validates a strictly monotonic grid and records that no
+certified error bound is available. Use `axis=` for arrays and
+`cumulative=True` for a running integral.
 
 ## ODEs / PDE
 
@@ -124,7 +129,10 @@ convergence theorem; G.5 stores all three flags explicitly.
 ```python
 kernel.ode_solve(rhs_id, "y", "x")            # sympy.dsolve + classification
 kernel.ode_solve_numeric([rhs_id], ["0", "1"], ["1"])          # RK45 mpmath
-kernel.ode_solve_numeric([rhs_id], ["0", "1"], ["1"], fast=True)  # float64
+kernel.ode_solve_numeric([rhs_id], ["0", "1"], ["1"], steps=20000) # float64 RK4
+kernel.ode_solve_numeric([rhs_id], ["0", "1"], ["1"],
+    method="DOP853", rtol=1e-10, atol=1e-12, max_step=0.05,
+    t_eval=[0, 0.5, 1])                                      # sci extra
 kernel.ode_ensemble([rhs_id], ["0", "1"], y0s, steps=1000)      # GPU/CPU batch
 kernel.pde_heat_1d(u0, alpha, dx, dt, steps)  # FTCS, r <= 1/2 enforced
 kernel.pde_heat_2d(u0, alpha, dx, dt, steps)  # 2D FTCS, r <= 1/4 enforced
@@ -142,7 +150,11 @@ boundaries are Dirichlet-zero. Tiers: Python reference -> njit -> CuPy
 Systems use state names `y0, y1, ...` in the rhs expressions; in symbolic
 `ode_solve` the bare `y` symbol means `y(x)`. Ensembles dispatch to a CUDA
 RawKernel (one thread per trajectory, RHS compiled from MathIR to C) or a
-process pool of float64 RK4. `MATHKERNEL_MAX_ODE_STEPS` caps the RK45 loop.
+process pool of float64 RK4. `t_eval` samples one integration through the
+reported continuous-extension/interpolation method; `dense_output=True`
+returns the accepted mesh. Integration and interpolation error information
+are separate and remain uncertified. `MATHKERNEL_MAX_ODE_STEPS` caps adaptive
+attempts, fixed steps and requested samples.
 
 ## Optimization
 

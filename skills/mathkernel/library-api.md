@@ -9,7 +9,7 @@ work, planning, or codegen.
 ```python
 r = kernel.parse("x^2 + 2*x + 1 = 0")        # or kernel.parse_latex(...)
 eid = r.data["expr_id"]
-kernel.get(eid)                               # MathIR + display
+kernel.get_expression(eid)                    # MathIR + display
 r2 = kernel.substitute(eid, {"x": "a + 1"})   # new expr_id
 ```
 
@@ -19,8 +19,8 @@ pi = `pi()`.
 ## Contexts
 
 ```python
-ctx = kernel.context_create(domains={"x": "positive", "n": "integer"})
-cid = ctx.data["context_id"]
+ctx = kernel.create_context(domains={"x": "positive", "n": "integer"})
+cid = ctx.context_id
 kernel.solve(eid, "x", context_id=cid)        # assumptions threaded through
 ```
 
@@ -43,6 +43,14 @@ kernel.product(eid, "k", "1", "n")
 ```python
 kernel.numeric_evaluate(eid, values={"x": "1.5"}, dps=50)   # trust numeric
 kernel.interval_evaluate(eid, bounds={"x": [1, 2]}, dps=50) # certified
+```
+
+Direct Python calls can return paged data. Before inspecting a potentially
+large result, complete and integrity-check it with:
+
+```python
+from mathkernel.python_api import complete_result
+result = complete_result(kernel, kernel.get_expression(eid))
 ```
 
 ## Matrices
@@ -83,7 +91,7 @@ kernel.execute_code(art.data["artifact_id"], inputs={"x": 1.0})
 ## Jobs (async)
 
 ```python
-job = kernel.job_submit("collatz", {"n_max": 12})
+job = kernel.job_submit("collatz_sieve", {"n_max": 12})
 kernel.job_status(job.data["job_id"])
 kernel.job_result(job.data["job_id"])
 ```

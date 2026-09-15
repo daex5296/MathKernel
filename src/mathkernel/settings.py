@@ -295,6 +295,8 @@ class Settings:
     max_field_degree: int = 64
     max_normal_form_dim: int = 128
     max_signal_samples: int = 65536
+    max_sampled_data_points: int = 1_000_000
+    max_sampled_data_cells: int = 5_000_000
     max_exact_dft_size: int = 64
     max_high_precision_dft_size: int = 256
     max_exact_window_size: int = 256

@@ -178,6 +178,7 @@ def prove_smt(z3eng, ir: Expr, domains: dict[str, str], fragment: dict,
     # concurrent.
     env = z3eng._env([ir, *assumptions], domains)
     goal = z3eng.to_z3(ir, env)
+    context_constraints = z3eng._context_constraints([ir, *assumptions], env, domains)
     if assumptions:
         goal = z3.Implies(z3.And(*[z3eng.to_z3(a, env) for a in assumptions]), goal)
     prepared = []
@@ -190,7 +191,7 @@ def prove_smt(z3eng, ir: Expr, domains: dict[str, str], fragment: dict,
                 continue
             constraints, valid_on = built
         else:
-            constraints, valid_on = [z3.Not(goal)], "unsat"
+            constraints, valid_on = [*context_constraints, z3.Not(goal)], "unsat"
         ctx = z3.Context()
         prepared.append((kind, z3, ctx, [c.translate(ctx) for c in constraints],
                          valid_on, z3eng.timeout_ms))

@@ -38,7 +38,7 @@ _GRAMMAR = r"""
 ?args: relation ("," relation)*
 REL: "=" | "!=" | "<=" | ">=" | "<" | ">"
 NAME: /[A-Za-z_][A-Za-z0-9_]*/
-DECIMAL: /(?:[0-9]+\.[0-9]+|\.[0-9]+)/
+DECIMAL: /(?:(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)[eE][+-]?[0-9]+|(?:[0-9]+\.[0-9]+|\.[0-9]+))/
 INTEGER: /[0-9]+/
 %import common.WS_INLINE
 %ignore WS_INLINE
@@ -72,7 +72,8 @@ class _ToIR(Transformer):
     def integer(self, xs): return IntegerNode(value=str(xs[0]))
     def real(self, xs):
         value = str(xs[0])
-        digits = len(value.replace(".", "").lstrip("0")) or 1
+        mantissa = re.split(r"[eE]", value, maxsplit=1)[0]
+        digits = len(mantissa.replace(".", "").lstrip("0")) or 1
         return RealNode(value=value, precision=digits)
     def symbol(self, xs):
         name = str(xs[0])

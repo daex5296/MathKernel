@@ -392,7 +392,9 @@ class Z3Engine:
         return self._available
 
     def _sort_for(self, symbol: str, domains: dict[str, str]):
-        return "Int" if domains.get(symbol, "real").lower() in {"int", "integer", "integers"} else "Real"
+        return "Int" if domains.get(symbol, "real").lower().replace("-", "_") in {
+            "int", "integer", "integers", "natural", "naturals",
+            "positive_integer", "positive_integers"} else "Real"
 
     def _symbols(self, node: Expr, out: set[str] | None = None, bound: set[str] | None = None) -> set[str]:
         if out is None: out = set()
@@ -426,6 +428,73 @@ class Z3Engine:
         names: set[str] = set()
         for n in nodes: self._symbols(n, names)
         return {n: (z3.Int(n) if self._sort_for(n, domains) == "Int" else z3.Real(n)) for n in names}
+
+    def _domain_constraints(self, env: dict, domains: dict[str, str]) -> list:
+        """Translate declared scalar domains into predicates for every SMT path."""
+        z3 = self.z3
+        predicates = []
+        for name, symbol in env.items():
+            domain = domains.get(name, "real").strip().lower().replace("-", "_")
+            if domain in {"complex", "complexes"}:
+                raise ValueError("Z3 arithmetic does not support complex domains")
+            if domain in {"natural", "naturals", "nonnegative", "non_negative"}:
+                predicates.append(symbol >= 0)
+            elif domain in {"positive", "positive_integer", "positive_integers"}:
+                predicates.append(symbol > 0)
+            elif domain in {"negative"}:
+                predicates.append(symbol < 0)
+            elif domain in {"nonpositive", "non_positive"}:
+                predicates.append(symbol <= 0)
+            elif domain in {"nonzero", "non_zero"}:
+                predicates.append(symbol != 0)
+            elif domain not in {"real", "reals", "rational", "rationals", "int", "integer", "integers"}:
+                raise ValueError(f"Unsupported Z3 domain for {name}: {domains[name]}")
+        return predicates
+
+    def _definedness_constraints(self, nodes: list[Expr], env: dict) -> list:
+        """Require every explicit MathIR denominator to be nonzero.
+
+        Z3 totalizes division, while MathIR uses ordinary field division.  These
+        guards prevent totalized values at undefined points from becoming
+        counterexamples or satisfying witnesses.
+        """
+        predicates = []
+
+        def visit(node: Expr) -> None:
+            if isinstance(node, BinaryNode):
+                visit(node.left)
+                visit(node.right)
+                if node.kind == "div":
+                    predicates.append(self.to_z3(node.right, env) != 0)
+            elif isinstance(node, UnaryNode):
+                visit(node.arg)
+            elif isinstance(node, NaryNode):
+                for arg in node.args:
+                    visit(arg)
+            elif isinstance(node, RelationNode):
+                visit(node.left); visit(node.right)
+            elif isinstance(node, BoolNode):
+                for arg in node.args:
+                    visit(arg)
+            elif isinstance(node, MembershipNode):
+                visit(node.element); visit(node.set)
+            elif isinstance(node, SetNode):
+                for element in node.elements or []:
+                    visit(element)
+            elif isinstance(node, SetOpNode):
+                for arg in node.args:
+                    visit(arg)
+            elif isinstance(node, QuantifierNode):
+                # Bound-variable guards belong inside the quantified formula and
+                # are outside this prototype's definedness transformation.
+                return
+        for node in nodes:
+            visit(node)
+        return predicates
+
+    def _context_constraints(self, nodes: list[Expr], env: dict,
+                             domains: dict[str, str]) -> list:
+        return self._domain_constraints(env, domains) + self._definedness_constraints(nodes, env)
 
     def to_z3(self, node: Expr, env: dict):
         z3 = self.z3
@@ -519,20 +588,35 @@ class Z3Engine:
         z3 = self.z3
         env = self._env([left, right, *assumptions], domains)
         solver = self._new_solver()
+        context_constraints = self._context_constraints([left, right, *assumptions], env, domains)
+        solver.add(*context_constraints)
         for a in assumptions: solver.add(self.to_z3(a, env))
-        solver.add(self.to_z3(left, env) != self.to_z3(right, env))
+        inequality = self.to_z3(left, env) != self.to_z3(right, env)
+        solver.add(inequality)
+        metadata = {"admissibility_constraints": [str(item) for item in context_constraints]}
         answer = solver.check()
-        if answer == z3.unsat: return "proved", None
+        if answer == z3.unsat: return "proved", None, metadata
         if answer == z3.sat:
             model = solver.model()
-            return "disproved", {name: str(model.eval(sym, model_completion=True)) for name, sym in env.items()}
-        return "unknown", None
+            # Defensively replay the original inequality and every domain /
+            # definedness condition before exposing an exact counterexample.
+            replay = [*context_constraints,
+                      *[self.to_z3(a, env) for a in assumptions], inequality]
+            validated = all(z3.is_true(model.eval(item, model_completion=True)) for item in replay)
+            metadata["witness_validated"] = validated
+            if not validated:
+                return "unknown", None, metadata
+            return "disproved", {
+                name: str(model.eval(sym, model_completion=True)) for name, sym in env.items()
+            }, metadata
+        return "unknown", None, metadata
 
     def check_context(self, assumptions: list[Expr], domains: dict[str,str]):
         if not self.available: raise RuntimeError("z3-solver is not installed")
         z3 = self.z3
         env = self._env(assumptions, domains)
         s = self._new_solver()
+        s.add(*self._context_constraints(assumptions, env, domains))
         for a in assumptions: s.add(self.to_z3(a, env))
         r = s.check()
         return "consistent" if r == z3.sat else ("inconsistent" if r == z3.unsat else "unknown")
@@ -544,6 +628,7 @@ class Z3Engine:
         z3 = self.z3
         env = self._env([relation, *assumptions], domains)
         s = self._new_solver()
+        s.add(*self._context_constraints([relation, *assumptions], env, domains))
         for a in assumptions: s.add(self.to_z3(a, env))
         s.add(self.to_z3(relation, env))
         r = s.check()
@@ -568,6 +653,7 @@ class Z3Engine:
         env=self._env([relation,*assumptions],domains)
         if variable not in env: raise ValueError(f"Variable {variable} does not occur in relation")
         solver = self._new_solver()
+        solver.add(*self._context_constraints([relation, *assumptions], env, domains))
         for a in assumptions: solver.add(self.to_z3(a,env))
         solver.add(self.to_z3(relation,env))
         for candidate in candidates:
